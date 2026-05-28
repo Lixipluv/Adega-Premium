@@ -67,8 +67,8 @@ export function WineFullDetail({ wine }: { wine: Wine }) {
           <InfoChip label="Uva" value={wine.grape_variety} />
           {wine.vintage_year && <InfoChip label="Safra" value={String(wine.vintage_year)} />}
           {wine.alcohol_pct != null && <InfoChip label="Álcool" value={`${wine.alcohol_pct}%`} />}
-          <InfoChip label="Doçura" value={SWEETNESS_LABELS[wine.sweetness_level || "seco"] || wine.sweetness_level} />
-          <InfoChip label="Corpo" value={BODY_LABELS[wine.body || "medio"] || wine.body} />
+          <InfoChip label="Doçura" value={SWEETNESS_LABELS[wine.sweetness_level || "seco"] || wine.sweetness_level || "Seco"} />
+          <InfoChip label="Corpo" value={BODY_LABELS[wine.body || "medio"] || wine.body || "Médio"} />
           <InfoChip label="Nível" value={KNOWLEDGE_LABELS[wine.knowledge_level || "intermediario"] || ""} />
           {wine.score_average > 0 && <InfoChip label="Nota" value={`★ ${wine.score_average.toFixed(1)}`} />}
         </div>

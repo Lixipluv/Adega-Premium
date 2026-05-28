@@ -1,9 +1,13 @@
 """Adega Premium API — FastAPI catalog, media, analytics, QR services."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import logging
 import os
+import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -19,27 +23,59 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("adega")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+ENV = os.getenv("ENV", "development")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://adega:adega_secret@postgres:5432/adega")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me-in-production")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN", "localhost:3000")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 
 CACHE_TTL = 300  # 5 min
 
+# Fail fast in production for critical config
+if ENV == "production":
+    missing = [v for v in ["ADMIN_TOKEN", "DATABASE_URL", "REDIS_URL"] if not os.getenv(v)]
+    if missing:
+        log.critical("FATAL: Missing required env vars for production: %s", missing)
+        sys.exit(1)
+    if not os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") in ("change-me-in-production", ""):
+        log.critical("FATAL: ADMIN_TOKEN must be set to a strong secret in production")
+        sys.exit(1)
+    r2_vars = ["R2_ENDPOINT", "R2_ACCESS_KEY", "R2_SECRET_KEY", "R2_BUCKET"]
+    missing_r2 = [v for v in r2_vars if not os.getenv(v)]
+    if missing_r2:
+        log.critical("FATAL: Production requires R2 object storage: missing %s", missing_r2)
+        sys.exit(1)
+
+if not ADMIN_TOKEN:
+    ADMIN_TOKEN = "change-me-in-production"
+    log.warning("ADMIN_TOKEN not set — using insecure default (dev only)")
+
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 
 
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log.info("Starting Adega Premium API | ENV=%s | CORS=%s", ENV, CORS_ORIGINS)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     app.state.redis = redis_lib.from_url(REDIS_URL, decode_responses=True)
+    log.info("Database pool and Redis connected")
     yield
     await app.state.pool.close()
     await app.state.redis.close()
+    log.info("Shutdown complete")
 
 
-app = FastAPI(title="Adega Premium API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Adega Premium API", version="2.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 
 app.add_middleware(
@@ -56,8 +92,9 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
 
 
-# ---------- Models ----------
-
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 class Wine(BaseModel):
     id: int
     name: str
@@ -111,8 +148,22 @@ class EventIn(BaseModel):
     event_type: str  # view | qr_scan | detail_open
 
 
-# ---------- Helpers ----------
+class QuizStepOption(BaseModel):
+    value: Optional[str] = None
+    label: str
+    emoji: str = ""
 
+
+class QuizStep(BaseModel):
+    step_id: str
+    title: str
+    subtitle: Optional[str] = None
+    options: list[QuizStepOption]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def require_admin(authorization: Optional[str] = Header(None)) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -161,8 +212,9 @@ def wine_row(row: asyncpg.Record) -> dict:
     }
 
 
-# ---------- Catalog ----------
-
+# ---------------------------------------------------------------------------
+# Catalog
+# ---------------------------------------------------------------------------
 @app.get("/wines")
 @limiter.limit("60/minute")
 async def list_wines(
@@ -335,8 +387,9 @@ async def list_tags(request: Request):
     return [dict(r) for r in rows]
 
 
-# ---------- Admin CRUD ----------
-
+# ---------------------------------------------------------------------------
+# Admin CRUD
+# ---------------------------------------------------------------------------
 @app.post("/wines", dependencies=[Depends(require_admin)])
 async def create_wine(payload: WineCreate):
     async with app.state.pool.acquire() as conn:
@@ -356,6 +409,7 @@ async def create_wine(payload: WineCreate):
             payload.on_promotion, payload.knowledge_level, payload.badges, payload.food_pairings,
         )
     await app.state.redis.flushdb()
+    log.info("Wine created: %s (id=%s)", payload.name, row["id"])
     return wine_row(row)
 
 
@@ -381,6 +435,7 @@ async def update_wine(wine_id: int, payload: WineCreate):
     if not row:
         raise HTTPException(404, "Wine not found")
     await app.state.redis.flushdb()
+    log.info("Wine updated: id=%s", wine_id)
     return wine_row(row)
 
 
@@ -389,39 +444,78 @@ async def delete_wine(wine_id: int):
     async with app.state.pool.acquire() as conn:
         result = await conn.execute("DELETE FROM wines WHERE id = $1", wine_id)
     await app.state.redis.flushdb()
-    return {"deleted": result.split()[-1] == "1"}
+    deleted = result.split()[-1] == "1"
+    log.info("Wine deleted: id=%s success=%s", wine_id, deleted)
+    return {"deleted": deleted}
 
 
-# ---------- Media ----------
+# ---------------------------------------------------------------------------
+# Media upload with retry
+# ---------------------------------------------------------------------------
+def _upload_to_r2(file_data: bytes, endpoint: str, bucket: str, access_key: str,
+                  secret_key: str, key: str, content_type: str) -> str:
+    import boto3
+    import botocore.exceptions as bce
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+    for attempt in range(3):
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=file_data,
+                ContentType=content_type,
+            )
+            return f"{endpoint}/{bucket}/{key}"
+        except bce.ClientError as exc:
+            if attempt == 2:
+                log.error("R2 upload failed after 3 attempts: %s", exc)
+                raise
+            wait = 2 ** attempt
+            log.warning("R2 upload attempt %d failed, retrying in %ds: %s", attempt + 1, wait, exc)
+            time.sleep(wait)
+    raise RuntimeError("Upload failed")
+
 
 @app.post("/media/upload", dependencies=[Depends(require_admin)])
 async def upload_media(file: UploadFile = File(...)):
     endpoint = os.getenv("R2_ENDPOINT", "")
     bucket = os.getenv("R2_BUCKET", "adega-media")
+    access_key = os.getenv("R2_ACCESS_KEY", "")
+    secret_key = os.getenv("R2_SECRET_KEY", "")
+
+    file_data = await file.read()
+    key = f"{uuid.uuid4().hex}-{file.filename}"
+
     if not endpoint:
-        # Local fallback: stash in /app/uploads and serve via API
+        if ENV == "production":
+            raise HTTPException(500, "Object storage not configured")
         uploads = "/app/uploads"
         os.makedirs(uploads, exist_ok=True)
-        fname = f"{uuid.uuid4().hex}-{file.filename}"
-        path = os.path.join(uploads, fname)
+        path = os.path.join(uploads, key)
         with open(path, "wb") as f:
-            f.write(await file.read())
-        return {"url": f"/uploads/{fname}"}
+            f.write(file_data)
+        return {"url": f"/uploads/{key}"}
 
-    import boto3
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=os.getenv("R2_ACCESS_KEY"),
-        aws_secret_access_key=os.getenv("R2_SECRET_KEY"),
-    )
-    key = f"{uuid.uuid4().hex}-{file.filename}"
-    s3.upload_fileobj(file.file, bucket, key, ExtraArgs={"ContentType": file.content_type})
-    return {"url": f"{endpoint}/{bucket}/{key}"}
+    try:
+        url = await asyncio.to_thread(
+            _upload_to_r2, file_data, endpoint, bucket, access_key, secret_key,
+            key, file.content_type or "application/octet-stream",
+        )
+        return {"url": url}
+    except Exception as exc:
+        log.error("Media upload error: %s", exc)
+        raise HTTPException(500, "Upload failed — check R2 configuration")
 
 
-# ---------- Analytics ----------
-
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
 @app.post("/events")
 async def log_event(event: EventIn):
     if event.event_type not in {"view", "qr_scan", "detail_open"}:
@@ -436,6 +530,9 @@ async def log_event(event: EventIn):
 
 @app.get("/analytics/top")
 async def top_wines():
+    cached = await cache_get("analytics:top")
+    if cached:
+        return cached
     async with app.state.pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -447,11 +544,94 @@ async def top_wines():
             LIMIT 10
             """
         )
-    return [{**wine_row(r), "views": r["views"]} for r in rows]
+    result = [{**wine_row(r), "views": r["views"]} for r in rows]
+    await cache_set("analytics:top", result, ttl=120)
+    return result
 
 
-# ---------- QR code ----------
+@app.get("/analytics/summary")
+async def analytics_summary():
+    cached = await cache_get("analytics:summary")
+    if cached:
+        return cached
+    async with app.state.pool.acquire() as conn:
+        total_wines = await conn.fetchval("SELECT COUNT(*) FROM wines")
+        total_events_30d = await conn.fetchval(
+            "SELECT COUNT(*) FROM events WHERE created_at > NOW() - INTERVAL '30 days'"
+        )
+        by_category = await conn.fetch(
+            "SELECT category, COUNT(*) AS count FROM wines GROUP BY category ORDER BY count DESC"
+        )
+        by_event_type = await conn.fetch(
+            """
+            SELECT event_type, COUNT(*) AS count FROM events
+            WHERE created_at > NOW() - INTERVAL '30 days'
+            GROUP BY event_type
+            """
+        )
+        top_today = await conn.fetch(
+            """
+            SELECT w.id, w.name, w.category, COUNT(e.id) AS views
+            FROM wines w
+            LEFT JOIN events e ON e.wine_id = w.id AND e.created_at > NOW() - INTERVAL '24 hours'
+            GROUP BY w.id
+            ORDER BY views DESC
+            LIMIT 5
+            """
+        )
+    result = {
+        "total_wines": total_wines,
+        "total_events_30d": total_events_30d,
+        "by_category": [dict(r) for r in by_category],
+        "by_event_type": [dict(r) for r in by_event_type],
+        "top_today": [
+            {"id": r["id"], "name": r["name"], "category": r["category"], "views": r["views"]}
+            for r in top_today
+        ],
+    }
+    await cache_set("analytics:summary", result, ttl=120)
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Quiz config
+# ---------------------------------------------------------------------------
+@app.get("/quiz/config")
+async def get_quiz_config():
+    cached = await cache_get("quiz:config")
+    if cached:
+        return cached
+    async with app.state.pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow("SELECT value FROM settings WHERE key='quiz_config'")
+        except Exception:
+            row = None
+    if not row:
+        return []
+    result = json.loads(row["value"])
+    await cache_set("quiz:config", result, ttl=3600)
+    return result
+
+
+@app.put("/quiz/config", dependencies=[Depends(require_admin)])
+async def update_quiz_config(config: list[QuizStep]):
+    data = [step.model_dump() for step in config]
+    async with app.state.pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO settings (key, value) VALUES ('quiz_config', $1::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            """,
+            json.dumps(data),
+        )
+    await app.state.redis.delete("quiz:config")
+    log.info("Quiz config updated")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# QR code
+# ---------------------------------------------------------------------------
 @app.get("/wines/{wine_id}/qr")
 async def wine_qr(wine_id: int):
     async with app.state.pool.acquire() as conn:
@@ -465,6 +645,9 @@ async def wine_qr(wine_id: int):
     return Response(content=buf.getvalue(), media_type="image/png")
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "env": ENV}
