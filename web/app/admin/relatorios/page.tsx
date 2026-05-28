@@ -6,30 +6,53 @@ import autoTable from "jspdf-autotable";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+const CATEGORY_COLORS: Record<string, string> = {
+  tinto: "#5C1A1A", branco: "#C9A84C", rose: "#C06080", espumante: "#2d2d2d",
+};
+const CATEGORY_LABELS: Record<string, string> = {
+  tinto: "Tinto", branco: "Branco", rose: "Rosé", espumante: "Espumante",
+};
+
 type TopWine = {
   id: number;
   name: string;
   views: number;
   country: string;
   category: string;
+  price_brl?: number;
+};
+
+type Summary = {
+  total_wines: number;
+  total_events_30d: number;
+  by_category: { category: string; count: number }[];
+  by_event_type: { event_type: string; count: number }[];
+  top_today: { id: number; name: string; category: string; views: number }[];
 };
 
 export default function RelatoriosPage() {
   const [topWines, setTopWines] = useState<TopWine[]>([]);
+  const [summary, setSummary] = useState<Summary | null>(null);
   const [loading, setLoading] = useState(true);
-  const [period, setPeriod] = useState("30d");
   const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     setLoading(true);
-    fetch(`${API}/analytics/top`)
-      .then((r) => r.json())
-      .then((data) => setTopWines(data || []))
-      .catch(() => setTopWines([]))
-      .finally(() => setLoading(false));
+    Promise.all([
+      fetch(`${API}/analytics/top`).then(r => r.json()).catch(() => []),
+      fetch(`${API}/analytics/summary`).then(r => r.json()).catch(() => null),
+    ]).then(([top, sum]) => {
+      setTopWines(top || []);
+      setSummary(sum);
+      setLoading(false);
+    });
   }, []);
 
-  const categoryData = [
+  const categoryData = summary?.by_category?.map(c => ({
+    name: CATEGORY_LABELS[c.category] || c.category,
+    value: c.count,
+    color: CATEGORY_COLORS[c.category] || "#9ca3af",
+  })) ?? [
     { name: "Tintos", value: 54, color: "#5C1A1A" },
     { name: "Brancos", value: 25, color: "#C9A84C" },
     { name: "Rosé", value: 12, color: "#E8A0B4" },
@@ -37,15 +60,17 @@ export default function RelatoriosPage() {
   ];
 
   const monthlyData = [
-    { month: "Jan", visitas: 1200, pedidos: 45 },
-    { month: "Fev", visitas: 1400, pedidos: 52 },
-    { month: "Mar", visitas: 1100, pedidos: 38 },
-    { month: "Abr", visitas: 1800, pedidos: 67 },
-    { month: "Mai", visitas: 2200, pedidos: 78 },
-    { month: "Jun", visitas: 1900, pedidos: 61 },
+    { month: "Jan", visitas: 1200 },
+    { month: "Fev", visitas: 1400 },
+    { month: "Mar", visitas: 1100 },
+    { month: "Abr", visitas: 1800 },
+    { month: "Mai", visitas: 2200 },
+    { month: "Jun", visitas: 1900 },
   ];
 
-  const totalViews = topWines.reduce((sum, w) => sum + (w.views || 0), 0);
+  const totalViews = summary?.total_events_30d ?? topWines.reduce((s, w) => s + (w.views || 0), 0);
+  const qrScans = summary?.by_event_type?.find(e => e.event_type === "qr_scan")?.count ?? 0;
+  const detailOpens = summary?.by_event_type?.find(e => e.event_type === "detail_open")?.count ?? 0;
 
   function exportPDF() {
     setExporting(true);
@@ -67,7 +92,7 @@ export default function RelatoriosPage() {
       doc.setTextColor(250, 246, 239);
       doc.text("Relatório de Desempenho", pageWidth / 2, 24, { align: "center" });
       doc.setFontSize(8);
-      doc.text(`Gerado em: ${dateStr} | Período: ${period === "7d" ? "7 dias" : period === "30d" ? "30 dias" : "90 dias"}`, pageWidth / 2, 31, { align: "center" });
+      doc.text(`Gerado em: ${dateStr} | Período: últimos 30 dias`, pageWidth / 2, 31, { align: "center" });
 
       // KPIs Section
       let y = 45;
@@ -82,10 +107,10 @@ export default function RelatoriosPage() {
       doc.setTextColor(60, 60, 60);
 
       const kpis = [
-        ["Total de Visualizações", totalViews.toLocaleString("pt-BR"), "+12%"],
+        ["Total de Eventos (30d)", totalViews.toLocaleString("pt-BR"), "Interações no período"],
         ["Vinho Mais Visto", topWines.length > 0 ? topWines[0].name : "—", topWines.length > 0 ? `${topWines[0].views} views` : ""],
-        ["Interações QR Code", "342", "+8%"],
-        ["Taxa de Conversão", "4.2%", "-0.3%"],
+        ["QR Scaneados", String(qrScans), "QR codes escaneados"],
+        ["Detalhes Abertos", String(detailOpens), "Fichas de produto"],
       ];
 
       autoTable(doc, {
@@ -170,8 +195,8 @@ export default function RelatoriosPage() {
         body: monthlyData.map((m) => [
           m.month,
           m.visitas.toLocaleString("pt-BR"),
-          String(m.pedidos),
-          ((m.pedidos / m.visitas) * 100).toFixed(1) + "%",
+          "—",
+          "—",
         ]),
         theme: "grid",
         headStyles: { fillColor: [92, 26, 26], textColor: [255, 255, 255], fontSize: 9, fontStyle: "bold" },
@@ -208,27 +233,10 @@ export default function RelatoriosPage() {
           <p className="text-gray-500 text-sm mt-1">Análises e métricas do sistema</p>
         </div>
         <div className="flex gap-2 items-center">
-          {[
-            { value: "7d", label: "7 dias" },
-            { value: "30d", label: "30 dias" },
-            { value: "90d", label: "90 dias" },
-          ].map((p) => (
-            <button
-              key={p.value}
-              onClick={() => setPeriod(p.value)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                period === p.value
-                  ? "bg-burgundy-deep text-cream"
-                  : "bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"
-              }`}
-            >
-              {p.label}
-            </button>
-          ))}
           <button
             onClick={exportPDF}
             disabled={exporting || loading}
-            className="ml-2 h-9 px-4 rounded-lg bg-gold text-burgundy-deep text-sm font-semibold flex items-center gap-2 hover:bg-gold-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+            className="h-9 px-4 rounded-lg bg-gold text-burgundy-deep text-sm font-semibold flex items-center gap-2 hover:bg-gold-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
           >
             {exporting ? (
               <div className="w-4 h-4 border-2 border-burgundy-deep/30 border-t-burgundy-deep rounded-full animate-spin" />
@@ -245,30 +253,10 @@ export default function RelatoriosPage() {
 
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <KpiCard
-          label="Total de Visualizações"
-          value={totalViews.toLocaleString("pt-BR")}
-          change="+12%"
-          positive
-        />
-        <KpiCard
-          label="Vinhos Mais Vistos"
-          value={topWines.length > 0 ? topWines[0]?.name?.slice(0, 15) + "..." : "—"}
-          change={topWines.length > 0 ? `${topWines[0]?.views} views` : ""}
-          positive
-        />
-        <KpiCard
-          label="Interações QR Code"
-          value="342"
-          change="+8%"
-          positive
-        />
-        <KpiCard
-          label="Taxa de Conversão"
-          value="4.2%"
-          change="-0.3%"
-          positive={false}
-        />
+        <KpiCard label="Eventos totais (30d)" value={totalViews.toLocaleString("pt-BR")} sub="interações no período" />
+        <KpiCard label="Vinhos no catálogo" value={String(summary?.total_wines ?? "—")} sub="cadastrados" />
+        <KpiCard label="QR codes escaneados" value={String(qrScans)} sub="últimos 30 dias" />
+        <KpiCard label="Fichas abertas" value={String(detailOpens)} sub="detalhes visualizados" />
       </div>
 
       {/* Charts Row */}
@@ -362,16 +350,12 @@ export default function RelatoriosPage() {
   );
 }
 
-function KpiCard({ label, value, change, positive }: { label: string; value: string; change: string; positive: boolean }) {
+function KpiCard({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
     <div className="bg-white rounded-xl border border-gray-100 p-5 shadow-sm">
       <p className="text-xs text-gray-500 font-medium">{label}</p>
-      <p className="text-xl font-bold text-burgundy-deep mt-1 truncate">{value}</p>
-      {change && (
-        <p className={`text-xs mt-1 font-medium ${positive ? "text-green-600" : "text-red-500"}`}>
-          {change} vs período anterior
-        </p>
-      )}
+      <p className="text-2xl font-bold text-burgundy-deep mt-1">{value}</p>
+      <p className="text-xs text-gray-400 mt-0.5">{sub}</p>
     </div>
   );
 }

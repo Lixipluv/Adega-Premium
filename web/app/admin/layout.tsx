@@ -12,11 +12,9 @@ export const useAuth = () => useContext(AuthContext);
 
 const NAV_ITEMS = [
   { label: "Produtos", href: "/admin", icon: "wine" },
-  { label: "Categorias", href: "/admin/categorias", icon: "grid" },
-  { label: "Pedidos", href: "/admin/pedidos", icon: "clipboard" },
-  { label: "Usuários", href: "/admin/usuarios", icon: "users" },
-  { label: "Configurações", href: "/admin/config", icon: "settings" },
   { label: "Relatórios", href: "/admin/relatorios", icon: "chart" },
+  { label: "Questionário", href: "/admin/quiz", icon: "quiz" },
+  { label: "Configurações", href: "/admin/config", icon: "settings" },
 ];
 
 function NavIcon({ icon, className }: { icon: string; className?: string }) {
@@ -67,6 +65,12 @@ function NavIcon({ icon, className }: { icon: string; className?: string }) {
       return (
         <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
           <path d="M18 20V10M12 20V4M6 20v-6" strokeLinecap="round" />
+        </svg>
+      );
+    case "quiz":
+      return (
+        <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" strokeLinecap="round" />
         </svg>
       );
     case "logout":

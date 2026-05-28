@@ -7,6 +7,7 @@ export const BODY_LABELS: Record<string, string> = {
 export const SWEETNESS_LABELS: Record<string, string> = {
   seco: "Seco",
   "meio-seco": "Meio-seco",
+  "meio-doce": "Meio-doce",
   doce: "Doce",
 };
 
