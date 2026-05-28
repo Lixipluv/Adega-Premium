@@ -1,0 +1,11 @@
+{
+  "name": "Adega Premium",
+  "short_name": "Adega",
+  "description": "Catálogo de Vinhos — Kiosk",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#5C1A1A",
+  "theme_color": "#5C1A1A",
+  "icons": []
+}
